@@ -185,8 +185,11 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastStatus: Int?
     private let autoRestore = true      // one automatic Force Restore if the check after Touch Bar On finds it dark
 
-    /// The Touch Bar's brightness level when it was last switched off. Switching the panel off
-    /// and on leaves the level at 0 (about 12 nits), so it's put back after each turn-on.
+    /// Switching the panel off and on leaves its brightness at the bottom of its range (about
+    /// 12 nits). With auto-brightness on, Blackout has macOS re-check the light sensor
+    /// (`Panel.recheckAutoBrightness`); `lastRecheck` stops it repeating that during the fade.
+    /// With auto-brightness off, it puts back `savedLevel`, the level when the bar was switched off.
+    private var lastRecheck = Date.distantPast
     private var savedLevel: Float?
 
     private func rememberLevel(_ reading: Panel.Reading) {
@@ -351,6 +354,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
             watchdog = nil
             dismissBlackBar()
             let ok = Panel.set(on: true)
+            bringBrightnessBackSoon()
             log("ON (\(source))\(ok ? "" : " [call failed]") before: \(before.text); re-darkened \(enforcedSinceOff)x while off")
             checkAfterOn(retry: autoRestore)
         }
@@ -374,32 +378,60 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self, !self.isActive, self.onGeneration == generation else { return }
             let ok = Panel.set(on: true)
+            self.bringBrightnessBackSoon()
             if !ok { self.log("  force restore: turnOn call failed") }
             self.checkAfterOn(retry: false)
             self.refreshUI()
         }
     }
 
-    /// After the bar is switched on: read the panel at +0.3 s and +1.5 s and log it. Put the
-    /// brightness back if it came up lower than when the bar was switched off. If the panel is
+    /// After the bar is switched on: read the panel at +0.3 s and +1.5 s and log it. Bring the
+    /// brightness back up if it's still at the bottom (`bringBrightnessBack`). If the panel is
     /// still dark, or lit but giving out no light, and `retry` is set, do one Force Restore.
     private func checkAfterOn(retry: Bool) {
         let generation = onGeneration
         for delay in [0.3, 1.5] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self = self, self.onGeneration == generation, !self.isActive || self.isPeeking else { return }
-                var reading = Panel.reading()
-                if let saved = self.savedLevel, reading.isLit == true,
-                   let level = reading.brightness?.level, level < saved - 0.02 {
-                    let ok = Panel.setBrightness(saved)
-                    self.log(String(format: "  brightness came back at %.0f%%, put back to %.0f%%%@",
-                                    level * 100, saved * 100, ok ? "" : " [failed]"))
-                    reading = Panel.reading()
-                }
+                self.bringBrightnessBack(at: String(format: "+%.1fs", delay))
+                let reading = Panel.reading()
                 let dark = reading.isLit == false || reading.looksDarkWhileLit
                 self.log(String(format: "  check +%.1fs: ", delay) + reading.text + (dark ? "  <- DARK AFTER ON" : ""))
                 if dark, retry, delay == 1.5, !self.isActive { self.forceRestore(source: "auto") }
             }
+        }
+    }
+
+    /// If the panel came on at the bottom of its brightness range, bring it back up: with
+    /// auto-brightness on, macOS re-checks the light and fades to the right level for the room;
+    /// with it off, the level from when the bar was switched off is put back.
+    @discardableResult
+    private func bringBrightnessBack(at when: String) -> Bool {
+        guard Panel.isLit == true, let level = Panel.brightness?.level else { return false }
+        if Panel.autoBrightness != false {
+            guard level < 0.005, Date().timeIntervalSince(lastRecheck) > 2 else { return false }
+            lastRecheck = Date()
+            let ok = Panel.recheckAutoBrightness()
+            log(String(format: "  brightness came back at %.0f%% (%@): auto-brightness re-check%@",
+                       level * 100, when, ok ? "" : " [failed]"))
+            if ok { return true }
+        }
+        guard let saved = savedLevel, level < saved - 0.02 else { return false }
+        let ok = Panel.setBrightness(saved)
+        log(String(format: "  brightness came back at %.0f%% (%@), put back to %.0f%%%@",
+                   level * 100, when, saved * 100, ok ? "" : " [failed]"))
+        return ok
+    }
+
+    /// Right after a turn-on. macOS drops the Touch Bar to the bottom of its brightness range
+    /// within about 50 ms of switching it on, so check now, again 50 ms later, and once more
+    /// in `checkAfterOn` as a backup.
+    private func bringBrightnessBackSoon() {
+        bringBrightnessBack(at: "now")
+        let generation = onGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self = self, self.onGeneration == generation, !self.isActive || self.isPeeking else { return }
+            self.bringBrightnessBack(at: "+0.05s")
         }
     }
 
@@ -552,6 +584,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         onGeneration += 1
         dismissBlackBar()
         Panel.set(on: true)
+        bringBrightnessBackSoon()
         log("PEEK")
         checkAfterOn(retry: false)
         peekDeadline = Date().addingTimeInterval(peekDuration)

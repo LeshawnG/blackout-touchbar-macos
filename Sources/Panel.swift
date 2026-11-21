@@ -132,16 +132,41 @@ enum Panel {
         return (level, number("Nits"), number("NitsPhysical"))
     }
 
-    /// Sets the Touch Bar's brightness `level` (0–1, as in `brightness`) through CoreBrightness.
-    /// Needed because switching the panel off and on leaves the level at 0 (about 12 nits),
-    /// which looks dark in a lit room; macOS only fixes it on the next wake from sleep.
-    @discardableResult
-    static func setBrightness(_ level: Float) -> Bool {
+    private static func setProperty(_ value: NSNumber, forKey key: String) -> Bool {
         guard let client = brightnessClient, let id = displayID else { return false }
         let selector = NSSelectorFromString("setProperty:withKey:andDisplay:")
         guard client.responds(to: selector) else { return false }
         typealias Set = @convention(c) (AnyObject, Selector, AnyObject, NSString, UInt64) -> Bool
-        return unsafeBitCast(client.method(for: selector), to: Set.self)(client, selector, NSNumber(value: level), "DisplayBrightness", id)
+        return unsafeBitCast(client.method(for: selector), to: Set.self)(client, selector, value, key as NSString, id)
+    }
+
+    /// Sets the Touch Bar's brightness `level` (0–1, as in `brightness`) through CoreBrightness.
+    /// Used only when auto-brightness is off (see `recheckAutoBrightness`).
+    @discardableResult
+    static func setBrightness(_ level: Float) -> Bool {
+        setProperty(NSNumber(value: level), forKey: "DisplayBrightness")
+    }
+
+    /// Whether macOS auto-brightness is on for the Touch Bar (CoreBrightness `DisplayBrightnessAuto`).
+    static var autoBrightness: Bool? {
+        guard let client = brightnessClient, let id = displayID else { return nil }
+        let selector = NSSelectorFromString("copyPropertyForKey:andDisplay:")
+        guard client.responds(to: selector) else { return nil }
+        typealias Copy = @convention(c) (AnyObject, Selector, NSString, UInt64) -> Unmanaged<AnyObject>?
+        let copy = unsafeBitCast(client.method(for: selector), to: Copy.self)
+        return (copy(client, selector, "DisplayBrightnessAuto", id)?.takeRetainedValue() as? NSNumber)?.boolValue
+    }
+
+    /// Switching the panel off and on leaves its brightness at the bottom of its range (about
+    /// 12 nits), and macOS doesn't re-check the light sensor until the screen next wakes.
+    /// Turning the Touch Bar's auto-brightness off and straight back on makes it re-check:
+    /// it fades the bar to the right level for the room in about half a second.
+    /// Both calls run back to back, so auto-brightness is never left off.
+    @discardableResult
+    static func recheckAutoBrightness() -> Bool {
+        let off = setProperty(NSNumber(value: 0), forKey: "DisplayBrightnessAuto")
+        let on = setProperty(NSNumber(value: 1), forKey: "DisplayBrightnessAuto")
+        return off && on
     }
 
     /// Integer getters on the DFR client (displayState, getDimmingStep, harmonyState).
