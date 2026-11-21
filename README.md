@@ -50,7 +50,7 @@ The real fix is a repair, usually a new top case. Blackout is for keeping the Ma
 
 ## Install
 
-1. Download **Blackout-1.0.0.zip** from [Releases](../../releases) and unzip it.
+1. Download **Blackout-1.0.1.zip** from [Releases](../../releases) and unzip it.
 2. Open **Blackout**. It isn't notarized by Apple, so macOS blocks it the first time:
    - Open **System Settings → Privacy & Security**.
    - Scroll down to the message about Blackout and click **Open Anyway**, then confirm.
