@@ -20,7 +20,8 @@
 //   ⌃⌥⌘0       Repair Touch Bar: for a bar that's on but blank while touch still works.
 //              Sleeps the display and wakes it 3 s later (the screen may lock).
 // The dark panel can't feel touches (see `touchtest`), so a shortcut has to wake it.
-// ⌥⌘0 while the bar is already on does a Force Restore: a full off → on cycle, logged.
+// ⌥⌘0 while the bar is already on does nothing; pressed twice within 2 s it does a
+// Force Restore: a full off → on cycle, logged.
 //
 // Command line:  Blackout on | off | status    (panel power directly, e.g. if the app ever crashed)
 //                Blackout diag                 (one-line panel reading; also see DebugLog.swift)
@@ -361,10 +362,25 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshUI()
     }
 
-    /// Touch Bar On (⌥⌘0, the menu, `Blackout key on`): switch on, or Force Restore if the
-    /// bar is already on, which is what you'd press when it's on but showing nothing.
+    /// Touch Bar On (⌥⌘0, the menu, `Blackout key on`): switch the bar on. If it's already on,
+    /// one press leaves it alone (no blink); a second press within 2 s does a Force Restore,
+    /// for when it's on but showing nothing. The press that switches it on doesn't count.
+    private var lastOnPressWhileOn: Date?
+    private let doublePressWindow: TimeInterval = 2
+
     private func requestOn(source: String) {
-        if isActive { setActive(false, source: source) } else { forceRestore(source: source) }
+        guard !isActive else {
+            lastOnPressWhileOn = nil
+            setActive(false, source: source)
+            return
+        }
+        if let last = lastOnPressWhileOn, Date().timeIntervalSince(last) < doublePressWindow {
+            lastOnPressWhileOn = nil
+            forceRestore(source: "\(source) twice")
+        } else {
+            lastOnPressWhileOn = Date()
+            log("on pressed while already on (\(source)): left as is; press again within 2 s to Force Restore")
+        }
     }
 
     /// A full off → on cycle with a new panel client, logged.

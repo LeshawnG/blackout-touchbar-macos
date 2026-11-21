@@ -67,7 +67,7 @@ You can also [build it yourself](#build-from-source).
 | Turn the Touch Bar off | **⌥⌘-**, or click the menu bar icon |
 | Brightness, volume or mute while it's off | **⌥⌘+** (Touch Bar Peek), then use the bar. It switches off after 5 s, or 3 s after your last change, whichever is later. Press **⌥⌘+** again for another 5 s. |
 | Turn it back on | **⌥⌘0**, click the icon, or quit Blackout |
-| It's on but shows nothing | Press **⌥⌘0** again: **Force Restore** switches the panel off and back on. Still blank? **⌃⌥⌘0** (**Repair Touch Bar**): the screen sleeps and wakes 3 s later, which resets the Touch Bar's display. If your Mac asks for a password after sleep, you'll unlock. No restart needed. |
+| It's on but shows nothing | Press **⌥⌘0** twice within 2 s: **Force Restore** switches the panel off and back on. (A single ⌥⌘0 while it's already on does nothing.) Still blank? **⌃⌥⌘0** (**Repair Touch Bar**): the screen sleeps and wakes 3 s later, which resets the Touch Bar's display. If your Mac asks for a password after sleep, you'll unlock. No restart needed. |
 | Start at login | Right-click the icon → **Start at Login** |
 
 Blackout starts with the Touch Bar on. A powered-off Touch Bar can't feel touches (see [How it works](#how-it-works)), so tapping a dark bar does nothing. Use **⌥⌘+**.
