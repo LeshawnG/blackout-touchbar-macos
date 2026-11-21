@@ -32,6 +32,7 @@ The real fix is a repair, usually a new top case. Blackout is for keeping the Ma
   | **⌥⌘0** | **Touch Bar On** |
   | **⌥⌘-** | **Touch Bar Off** |
   | **⌥⌘+** (or ⌥⌘=) | **Touch Bar Peek**: auto-off in 5 s. Use it for brightness, volume or mute while the bar is off. It waits while you're still adjusting. |
+  | **⌃⌥⌘0** | **Repair Touch Bar**: for a bar that's on but blank. The screen blinks off for 3 s, then you unlock. |
 
 - **Menu bar icon:** click it to switch the bar on or off, or right-click it for the menu. The menu also shows the Touch Bar's current brightness.
 - **Start at Login**, and an offer to move the app to Applications on first launch.
@@ -66,6 +67,7 @@ You can also [build it yourself](#build-from-source).
 | Turn the Touch Bar off | **⌥⌘-**, or click the menu bar icon |
 | Brightness, volume or mute while it's off | **⌥⌘+** (Touch Bar Peek), then use the bar. It switches off after 5 s, or 3 s after your last change, whichever is later. Press **⌥⌘+** again for another 5 s. |
 | Turn it back on | **⌥⌘0**, click the icon, or quit Blackout |
+| It's on but shows nothing | Press **⌥⌘0** again: **Force Restore** switches the panel off and back on. Still blank? **⌃⌥⌘0** (**Repair Touch Bar**): the screen sleeps and wakes 3 s later, which resets the Touch Bar's display. If your Mac asks for a password after sleep, you'll unlock. No restart needed. |
 | Start at login | Right-click the icon → **Start at Login** |
 
 Blackout starts with the Touch Bar on. A powered-off Touch Bar can't feel touches (see [How it works](#how-it-works)), so tapping a dark bar does nothing. Use **⌥⌘+**.
@@ -79,7 +81,8 @@ Blackout uses private macOS frameworks, all looked up at runtime. If a macOS upd
 - **Black backup:** a full-width "system modal" Touch Bar (`+[NSTouchBar presentSystemModalTouchBar:…]`) containing only black. Anything that briefly lights the panel shows black, not buttons.
 - **Shortcuts:** Carbon `RegisterEventHotKey`. macOS only tells the app when those exact key combinations are pressed, so no Accessibility or Input Monitoring permission is needed. Only these exact combinations are taken. Similar shortcuts without Option, such as Word's ⌘= / ⌘⇧= for subscript and superscript, still work.
 - **Touch Bar Peek:** the bar stays lit for at least 5 s, and for 3 s after volume, mute or display brightness last *changed*. It doesn't watch input in general, because typing or a palm on the trackpad would keep it lit.
-- **Brightness readout:** `BrightnessSystemClient` (`CoreBrightness.framework`), read only.
+- **Brightness:** `BrightnessSystemClient` (`CoreBrightness.framework`). Switching the panel off and on leaves its brightness at the lowest level (about 12 nits), which looks dark in a lit room. Blackout notes the level when it switches the bar off and puts it back after each turn-on.
+- **Repair Touch Bar:** `pmset displaysleepnow`, then `caffeinate -u` 3 s later to wake the display. Sometimes the Touch Bar stays blank while touch still works. Restarting ControlStrip or TouchBarServer doesn't clear that, but a display sleep and wake does.
 
 `Blackout touchtest` runs a guided 2-minute experiment with an on-screen window and spoken steps. It showed that **a powered-off panel's touch sensor is off too**: taps on the dark bar produced no events at all. That's why the bar is woken with a shortcut rather than a tap.
 
@@ -88,8 +91,9 @@ Blackout uses private macOS frameworks, all looked up at runtime. If a macOS upd
 ```bash
 B=/Applications/Blackout.app/Contents/MacOS/Blackout
 $B status          # lit or dark, plus brightness
+$B diag            # full panel reading (status, dimming step, nits) and where the log is
 $B on | off        # switch the panel directly, e.g. if the app ever crashed while the bar was off
-$B key off         # same as ⌥⌘- in the running app (also: key on, key peek)
+$B key off         # same as ⌥⌘- in the running app (also: key on, key peek, key repair)
 $B login on | off  # Start at Login
 $B touchtest       # does your Touch Bar feel touches while it's dark?
 $B version

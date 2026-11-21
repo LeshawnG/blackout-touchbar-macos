@@ -17,10 +17,14 @@
 //   ⌥⌘-        Touch Bar Off
 //   ⌥⌘+ / ⌥⌘=  Touch Bar Peek: on while it's off, to use brightness / volume / mute; auto-off in 5 s
 //              (or 3 s after the last change to one of them, whichever is later).
+//   ⌃⌥⌘0       Repair Touch Bar: for a bar that's on but blank while touch still works.
+//              Sleeps the display and wakes it 3 s later (the screen may lock).
 // The dark panel can't feel touches (see `touchtest`), so a shortcut has to wake it.
+// ⌥⌘0 while the bar is already on does a Force Restore: a full off → on cycle, logged.
 //
 // Command line:  Blackout on | off | status    (panel power directly, e.g. if the app ever crashed)
-//                Blackout key on | off | peek   (same as ⌥⌘0 / ⌥⌘- / ⌥⌘+ in the running app)
+//                Blackout diag                 (one-line panel reading; also see DebugLog.swift)
+//                Blackout key on | off | peek | repair   (same as the shortcuts, in the running app)
 //                Blackout login on | off       (Start at Login)
 //                Blackout touchtest            (guided test: does the bar feel touches when dark?)
 //                Blackout version
@@ -56,9 +60,13 @@ if let command = cliArgs.first {
         case .none: print("Touch Bar status unavailable")
         }
         exit(0)
+    case "diag":
+        print(Panel.reading().text)
+        print("log: \(DebugLog.url.path)")
+        exit(0)
     case "key":
-        guard let action = cliArgs.dropFirst().first, ["on", "off", "peek"].contains(action) else {
-            print("usage: Blackout key on|off|peek")
+        guard let action = cliArgs.dropFirst().first, ["on", "off", "peek", "repair"].contains(action) else {
+            print("usage: Blackout key on|off|peek|repair")
             exit(2)
         }
         DistributedNotificationCenter.default().postNotificationName(
@@ -84,7 +92,7 @@ if let command = cliArgs.first {
         print("Blackout \(appVersion)")
         exit(0)
     default:
-        print("usage: Blackout [on | off | status | key on|off|peek | login on|off | touchtest | version]")
+        print("usage: Blackout [on | off | status | diag | key on|off|peek | login on|off | touchtest | version]")
         print("       (no argument starts the menu bar app)")
         exit(2)
     }
@@ -152,6 +160,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let onItem = NSMenuItem(title: "Touch Bar On", action: #selector(turnOn), keyEquivalent: "0")
     private let offItem = NSMenuItem(title: "Touch Bar Off", action: #selector(turnOff), keyEquivalent: "-")
     private let peekItem = NSMenuItem(title: "Touch Bar Peek (auto-off in 5 s)", action: #selector(peek), keyEquivalent: "=")
+    private let repairItem = NSMenuItem(title: "Repair Touch Bar (screen blinks, then unlock)", action: #selector(repairFromMenu), keyEquivalent: "0")
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let shortcutNote = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
@@ -170,6 +179,26 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let peekDuration: TimeInterval = 5          // ⌥⌘+ lights the bar this long
     private let peekAfterLastChange: TimeInterval = 3   // ...or until 3 s after the last brightness/volume/mute change
 
+    // Diagnostics for the "Touch Bar stays dark after Touch Bar On" bug (see DebugLog.swift).
+    private var onGeneration = 0        // bumped on every switch, so a late check can tell it's stale
+    private var enforcedSinceOff = 0    // times macOS lit the panel and Blackout switched it off again
+    private var lastStatus: Int?
+    private let autoRestore = true      // one automatic Force Restore if the check after Touch Bar On finds it dark
+
+    /// The Touch Bar's brightness level when it was last switched off. Switching the panel off
+    /// and on leaves the level at 0 (about 12 nits), so it's put back after each turn-on.
+    private var savedLevel: Float?
+
+    private func rememberLevel(_ reading: Panel.Reading) {
+        guard reading.isLit == true, let level = reading.brightness?.level else { return }
+        // A put-back level reads about 1% low afterwards; ignore small drops so repeated
+        // off/on cycles don't ratchet the brightness down.
+        if let saved = savedLevel, level < saved, saved - level < 0.03 { return }
+        savedLevel = level
+    }
+
+    private func log(_ text: String) { DebugLog.write(text) }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One copy only (e.g. opened by hand while the login copy is already running).
         let me = ProcessInfo.processInfo.processIdentifier
@@ -187,15 +216,17 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         buildMenu()
 
+        log("launch \(appVersion): \(Panel.reading().text)")
+
         // macOS powers the panel back on after key presses, wake and unlock; switch it off again.
-        Panel.onStatusChange { _ in
-            DispatchQueue.main.async { [weak self] in self?.enforce() }
+        Panel.onStatusChange { raw in
+            DispatchQueue.main.async { [weak self] in self?.statusChanged(raw) }
         }
         let ws = NSWorkspace.shared.notificationCenter
-        ws.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
-        ws.addObserver(self, selector: #selector(woke), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        ws.addObserver(self, selector: #selector(woke(_:)), name: NSWorkspace.didWakeNotification, object: nil)
+        ws.addObserver(self, selector: #selector(woke(_:)), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
         DistributedNotificationCenter.default().addObserver(
-            self, selector: #selector(woke), name: .init("com.apple.screenIsUnlocked"), object: nil)
+            self, selector: #selector(woke(_:)), name: .init("com.apple.screenIsUnlocked"), object: nil)
 
         // Start with the Touch Bar on (and relight it if a crash ever left it dark).
         if Panel.isLit == false { Panel.set(on: true) }
@@ -203,7 +234,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        setActive(false)
+        setActive(false, source: "quit")
     }
 
     // MARK: Menu bar icon and menu
@@ -222,6 +253,9 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.keyEquivalentModifierMask = [.command, .option]
                 menu.addItem(item)
             }
+            repairItem.target = self
+            repairItem.keyEquivalentModifierMask = [.command, .option, .control]
+            menu.addItem(repairItem)
             statusLine.isEnabled = false
             menu.addItem(statusLine)
             if !unavailableShortcuts.isEmpty {
@@ -264,7 +298,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
         } else {
-            setActive(!isActive)
+            setActive(!isActive, source: "click")
         }
     }
 
@@ -283,7 +317,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         image.accessibilityDescription = isActive ? "Touch Bar off" : "Touch Bar on"
         button.image = image
         button.toolTip = "Blackout: Touch Bar " + (isActive ? "off" : "on")
-            + ". Click to switch, right-click for the menu. ⌥⌘0 Touch Bar On · ⌥⌘- Touch Bar Off · ⌥⌘+ Touch Bar Peek"
+            + ". Click to switch, right-click for the menu. ⌥⌘0 Touch Bar On · ⌥⌘- Touch Bar Off · ⌥⌘+ Touch Bar Peek · ⌃⌥⌘0 Repair"
     }
 
     private func statusText() -> String {
@@ -300,20 +334,83 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: On / off
 
-    private func setActive(_ on: Bool) {
+    private func setActive(_ on: Bool, source: String) {
+        let before = Panel.reading()
         stopPeek()
         isActive = on
+        onGeneration += 1
         if on {
+            rememberLevel(before)
             presentBlackBar()
-            Panel.set(on: false)
+            let ok = Panel.set(on: false)
             startWatchdog()
+            enforcedSinceOff = 0
+            log("OFF (\(source))\(ok ? "" : " [call failed]") before: \(before.text)")
         } else {
             watchdog?.invalidate()
             watchdog = nil
             dismissBlackBar()
-            Panel.set(on: true)
+            let ok = Panel.set(on: true)
+            log("ON (\(source))\(ok ? "" : " [call failed]") before: \(before.text); re-darkened \(enforcedSinceOff)x while off")
+            checkAfterOn(retry: autoRestore)
         }
         refreshUI()
+    }
+
+    /// Touch Bar On (⌥⌘0, the menu, `Blackout key on`): switch on, or Force Restore if the
+    /// bar is already on, which is what you'd press when it's on but showing nothing.
+    private func requestOn(source: String) {
+        if isActive { setActive(false, source: source) } else { forceRestore(source: source) }
+    }
+
+    /// A full off → on cycle with a new panel client, logged.
+    private func forceRestore(source: String) {
+        log("FORCE RESTORE (\(source)) before: \(Panel.reading().text)")
+        onGeneration += 1
+        let generation = onGeneration
+        dismissBlackBar()
+        Panel.resetClient()
+        Panel.set(on: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self, !self.isActive, self.onGeneration == generation else { return }
+            let ok = Panel.set(on: true)
+            if !ok { self.log("  force restore: turnOn call failed") }
+            self.checkAfterOn(retry: false)
+            self.refreshUI()
+        }
+    }
+
+    /// After the bar is switched on: read the panel at +0.3 s and +1.5 s and log it. Put the
+    /// brightness back if it came up lower than when the bar was switched off. If the panel is
+    /// still dark, or lit but giving out no light, and `retry` is set, do one Force Restore.
+    private func checkAfterOn(retry: Bool) {
+        let generation = onGeneration
+        for delay in [0.3, 1.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, self.onGeneration == generation, !self.isActive || self.isPeeking else { return }
+                var reading = Panel.reading()
+                if let saved = self.savedLevel, reading.isLit == true,
+                   let level = reading.brightness?.level, level < saved - 0.02 {
+                    let ok = Panel.setBrightness(saved)
+                    self.log(String(format: "  brightness came back at %.0f%%, put back to %.0f%%%@",
+                                    level * 100, saved * 100, ok ? "" : " [failed]"))
+                    reading = Panel.reading()
+                }
+                let dark = reading.isLit == false || reading.looksDarkWhileLit
+                self.log(String(format: "  check +%.1fs: ", delay) + reading.text + (dark ? "  <- DARK AFTER ON" : ""))
+                if dark, retry, delay == 1.5, !self.isActive { self.forceRestore(source: "auto") }
+            }
+        }
+    }
+
+    /// DFR status callback. While the bar should be on, log each change (that's when an
+    /// unexpected dark panel would show up); while it's off, just switch it off again.
+    private func statusChanged(_ raw: Int) {
+        if (!isActive || isPeeking) && raw != lastStatus {
+            log("status callback \(raw) while on: \(Panel.reading().text)")
+        }
+        lastStatus = raw
+        enforce()
     }
 
     private func presentBlackBar() {
@@ -336,6 +433,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func enforce() {
         guard isActive, !isPeeking, Panel.isLit == true else { return }
         Panel.set(on: false)
+        enforcedSinceOff += 1
     }
 
     /// Backup for a missed status callback. Reading the status is cheap.
@@ -346,8 +444,36 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchdog = timer
     }
 
-    @objc private func turnOn() { setActive(false) }
-    @objc private func turnOff() { setActive(true) }
+    @objc private func turnOn() { requestOn(source: "menu") }
+    @objc private func turnOff() { setActive(true, source: "menu") }
+    @objc private func repairFromMenu() { repair(source: "menu") }
+
+    /// Repair Touch Bar (⌃⌥⌘0, the menu, `Blackout key repair`): for a bar that's on but blank
+    /// while touch still works. Switching the panel off and on, restarting ControlStrip and
+    /// TouchBarServer, and putting the brightness back didn't clear that state on 2026-11-21;
+    /// a display sleep and wake did. So: bar on, display to sleep, wake it 3 s later.
+    /// The screen locks if the Mac asks for the password after the display sleeps.
+    private func repair(source: String) {
+        log("REPAIR (\(source)) before: \(Panel.reading().text)")
+        if isActive { setActive(false, source: "repair") }
+        run("/usr/bin/pmset", ["displaysleepnow"])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.run("/usr/bin/caffeinate", ["-u", "-t", "2"])   // declares user activity, which wakes the display
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self = self else { return }
+                self.log("  repair: display woken: \(Panel.reading().text)")
+                self.checkAfterOn(retry: false)
+                self.refreshUI()
+            }
+        }
+    }
+
+    private func run(_ path: String, _ arguments: [String]) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        do { try process.run() } catch { log("  \(path) failed: \(error.localizedDescription)") }
+    }
 
     @objc private func toggleLogin() {
         do {
@@ -365,7 +491,8 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showAbout() {
         let credits = NSMutableAttributedString(
             string: "Switches the Touch Bar off: a fix for flashing and flickering Touch Bars.\n\n"
-                + "⌥⌘0  Touch Bar On\n⌥⌘-  Touch Bar Off\n⌥⌘+  Touch Bar Peek (auto-off in 5 s)\n\n",
+                + "⌥⌘0  Touch Bar On\n⌥⌘-  Touch Bar Off\n⌥⌘+  Touch Bar Peek (auto-off in 5 s)\n"
+                + "⌃⌥⌘0  Repair Touch Bar (screen blinks)\n\n",
             attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.labelColor])
         credits.append(NSAttributedString(string: repoURL.absoluteString.replacingOccurrences(of: "https://", with: ""),
                                           attributes: [.font: NSFont.systemFont(ofSize: 11), .link: repoURL]))
@@ -381,10 +508,11 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func registerShortcuts() {
         let optCmd = UInt32(cmdKey | optionKey)
         let shortcuts: [(name: String, key: Int, mods: UInt32, action: () -> Void)] = [
-            ("⌥⌘0", kVK_ANSI_0, optCmd, { [weak self] in self?.turnOn() }),
-            ("⌥⌘-", kVK_ANSI_Minus, optCmd, { [weak self] in self?.turnOff() }),
+            ("⌥⌘0", kVK_ANSI_0, optCmd, { [weak self] in self?.requestOn(source: "⌥⌘0") }),
+            ("⌥⌘-", kVK_ANSI_Minus, optCmd, { [weak self] in self?.setActive(true, source: "⌥⌘-") }),
             ("⌥⌘=", kVK_ANSI_Equal, optCmd, { [weak self] in self?.peek() }),
             ("⌥⌘+", kVK_ANSI_Equal, optCmd | UInt32(shiftKey), { [weak self] in self?.peek() }),
+            ("⌃⌥⌘0", kVK_ANSI_0, optCmd | UInt32(controlKey), { [weak self] in self?.repair(source: "⌃⌥⌘0") }),
         ]
         for (index, shortcut) in shortcuts.enumerated() {
             if let hotKey = HotKey(keyCode: UInt32(shortcut.key), modifiers: shortcut.mods,
@@ -398,12 +526,13 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
               unavailableShortcuts.isEmpty ? "" : " (taken: \(unavailableShortcuts.joined(separator: " ")))")
     }
 
-    /// `Blackout key on|off|peek`
+    /// `Blackout key on|off|peek|repair`
     @objc private func shortcutFromCommandLine(_ note: Notification) {
         switch note.userInfo?["action"] as? String {
-        case "on": turnOn()
-        case "off": turnOff()
+        case "on": requestOn(source: "cli")
+        case "off": setActive(true, source: "cli")
         case "peek": peek()
+        case "repair": repair(source: "cli")
         default: break
         }
     }
@@ -420,8 +549,11 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startPeek() {
         isPeeking = true
+        onGeneration += 1
         dismissBlackBar()
         Panel.set(on: true)
+        log("PEEK")
+        checkAfterOn(retry: false)
         peekDeadline = Date().addingTimeInterval(peekDuration)
         lastControls = Controls.now()
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.checkPeek() }
@@ -457,6 +589,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard isPeeking else { return }
         stopPeek()
         if isActive {
+            rememberLevel(Panel.reading())
             presentBlackBar()
             Panel.set(on: false)
         }
@@ -469,7 +602,8 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isPeeking = false
     }
 
-    @objc private func woke() {
+    @objc private func woke(_ note: Notification) {
+        log("\(note.name.rawValue) (bar \(isActive ? "off" : "on")): \(Panel.reading().text)")
         if isPeeking { endPeek() }
         guard isActive else { return }
         // The Touch Bar service takes a moment to come back after wake/unlock.
