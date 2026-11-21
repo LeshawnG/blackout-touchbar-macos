@@ -201,6 +201,40 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         savedLevel = level
     }
 
+    /// What auto-brightness settled on at each light level, learned as Blackout runs and kept
+    /// across launches. Keys are quarter-octave lux steps (each about 19% apart). After a
+    /// turn-on, Blackout writes the level for the current light straight away (the bar is
+    /// right within about 15 ms) and then has auto-brightness re-check, which corrects it in
+    /// about half a second if the light has changed. Without a match, it's just the re-check.
+    private var autoLevels: [Int: Float] = {
+        let stored = UserDefaults.standard.dictionary(forKey: "autoLevelByLux") ?? [:]
+        var levels: [Int: Float] = [:]
+        for (key, value) in stored { if let step = Int(key), let level = value as? NSNumber { levels[step] = level.floatValue } }
+        return levels
+    }()
+
+    private static func luxStep(_ lux: Float) -> Int { Int((log2(max(lux, 1)) * 4).rounded()) }
+
+    /// Note the level auto-brightness has the lit bar at, for the current light.
+    private func learnAutoLevel() {
+        guard Panel.autoBrightness == true, Panel.isLit == true,
+              let lux = Panel.lux, let level = Panel.brightness?.level, level > 0.005 else { return }
+        let step = Self.luxStep(lux)
+        guard autoLevels[step].map({ abs($0 - level) > 0.005 }) ?? true else { return }
+        autoLevels[step] = level
+        UserDefaults.standard.set(Dictionary(uniqueKeysWithValues: autoLevels.map { (String($0.key), NSNumber(value: $0.value)) }),
+                                  forKey: "autoLevelByLux")
+    }
+
+    /// The learned level for the current light: same step, or the average of the steps either side.
+    private func learnedAutoLevel() -> Float? {
+        guard let lux = Panel.lux else { return nil }
+        let step = Self.luxStep(lux)
+        if let level = autoLevels[step] { return level }
+        let near = [autoLevels[step - 1], autoLevels[step + 1]].compactMap { $0 }
+        return near.isEmpty ? nil : near.reduce(0, +) / Float(near.count)
+    }
+
     private func log(_ text: String) { DebugLog.write(text) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -232,13 +266,22 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(woke(_:)), name: .init("com.apple.screenIsUnlocked"), object: nil)
 
-        // Start with the Touch Bar on (and relight it if a crash ever left it dark).
+        // Start with the Touch Bar on (and relight it if a crash ever left it dark), at the
+        // right brightness: an earlier switch-on may have left it at the bottom of its range.
         if Panel.isLit == false { Panel.set(on: true) }
+        bringBrightnessBackSoon()
         refreshUI()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         setActive(false, source: "quit")
+        // The app is exiting, so the usual timed brightness check won't run: wait here (up to
+        // 0.3 s) for the level to drop after the switch-on, and bring it back up before quitting.
+        let start = Date()
+        while Date().timeIntervalSince(start) < 0.3 {
+            if bringBrightnessBack(at: "quit") { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
     }
 
     // MARK: Menu bar icon and menu
@@ -344,6 +387,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isActive = on
         onGeneration += 1
         if on {
+            learnAutoLevel()
             rememberLevel(before)
             presentBlackBar()
             let ok = Panel.set(on: false)
@@ -413,23 +457,29 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let reading = Panel.reading()
                 let dark = reading.isLit == false || reading.looksDarkWhileLit
                 self.log(String(format: "  check +%.1fs: ", delay) + reading.text + (dark ? "  <- DARK AFTER ON" : ""))
+                if !dark, delay == 1.5 { self.learnAutoLevel() }   // auto-brightness has settled by now
                 if dark, retry, delay == 1.5, !self.isActive { self.forceRestore(source: "auto") }
             }
         }
     }
 
-    /// If the panel came on at the bottom of its brightness range, bring it back up: with
-    /// auto-brightness on, macOS re-checks the light and fades to the right level for the room;
-    /// with it off, the level from when the bar was switched off is put back.
+    /// If the panel came on at the bottom of its brightness range, bring it back up. With
+    /// auto-brightness on: write the learned level for the current light (instant), then have
+    /// macOS re-check the light, which fades to the right level if that guess was off.
+    /// With auto-brightness off, the level from when the bar was switched off is put back.
     @discardableResult
     private func bringBrightnessBack(at when: String) -> Bool {
         guard Panel.isLit == true, let level = Panel.brightness?.level else { return false }
         if Panel.autoBrightness != false {
             guard level < 0.005, Date().timeIntervalSince(lastRecheck) > 2 else { return false }
             lastRecheck = Date()
+            var learned = ", no learned level for this light"
+            if let guess = learnedAutoLevel(), Panel.setBrightness(guess) {
+                learned = String(format: ", learned level %.0f%% set", guess * 100)
+            }
             let ok = Panel.recheckAutoBrightness()
-            log(String(format: "  brightness came back at %.0f%% (%@): auto-brightness re-check%@",
-                       level * 100, when, ok ? "" : " [failed]"))
+            log(String(format: "  brightness came back at %.0f%% (%@, %.0f lux)%@, auto-brightness re-check%@",
+                       level * 100, when, Panel.lux ?? -1, learned, ok ? "" : " [failed]"))
             if ok { return true }
         }
         guard let saved = savedLevel, level < saved - 0.02 else { return false }
@@ -440,22 +490,28 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Right after a turn-on. macOS drops the Touch Bar to the bottom of its brightness range
-    /// within about 50 ms of switching it on, so check now, again 50 ms later, and once more
-    /// in `checkAfterOn` as a backup.
+    /// 10–50 ms after switching it on, so check every 10 ms for up to 0.25 s and act as soon
+    /// as it has dropped. `checkAfterOn` checks again at 0.3 s and 1.5 s as a backup.
     private func bringBrightnessBackSoon() {
-        bringBrightnessBack(at: "now")
         let generation = onGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            guard let self = self, self.onGeneration == generation, !self.isActive || self.isPeeking else { return }
-            self.bringBrightnessBack(at: "+0.05s")
+        let start = Date()
+        func attempt() {
+            guard onGeneration == generation, !isActive || isPeeking else { return }
+            let elapsed = Date().timeIntervalSince(start)
+            if bringBrightnessBack(at: String(format: "+%.0f ms", elapsed * 1000)) || elapsed > 0.25 { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { attempt() }
         }
+        attempt()
     }
 
     /// DFR status callback. While the bar should be on, log each change (that's when an
-    /// unexpected dark panel would show up); while it's off, just switch it off again.
+    /// unexpected dark panel would show up), and when it lights up, bring the brightness up:
+    /// macOS's own wake from its idle-off also leaves the bar at the bottom of its range.
+    /// While it's off, just switch it off again.
     private func statusChanged(_ raw: Int) {
         if (!isActive || isPeeking) && raw != lastStatus {
             log("status callback \(raw) while on: \(Panel.reading().text)")
+            if Panel.isLit == true { bringBrightnessBackSoon() }
         }
         lastStatus = raw
         enforce()
@@ -638,6 +694,7 @@ final class Blackout: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard isPeeking else { return }
         stopPeek()
         if isActive {
+            learnAutoLevel()
             rememberLevel(Panel.reading())
             presentBlackBar()
             Panel.set(on: false)

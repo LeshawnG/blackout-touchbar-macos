@@ -147,15 +147,20 @@ enum Panel {
         setProperty(NSNumber(value: level), forKey: "DisplayBrightness")
     }
 
-    /// Whether macOS auto-brightness is on for the Touch Bar (CoreBrightness `DisplayBrightnessAuto`).
-    static var autoBrightness: Bool? {
+    private static func copyNumber(forKey key: String) -> NSNumber? {
         guard let client = brightnessClient, let id = displayID else { return nil }
         let selector = NSSelectorFromString("copyPropertyForKey:andDisplay:")
         guard client.responds(to: selector) else { return nil }
         typealias Copy = @convention(c) (AnyObject, Selector, NSString, UInt64) -> Unmanaged<AnyObject>?
         let copy = unsafeBitCast(client.method(for: selector), to: Copy.self)
-        return (copy(client, selector, "DisplayBrightnessAuto", id)?.takeRetainedValue() as? NSNumber)?.boolValue
+        return copy(client, selector, key as NSString, id)?.takeRetainedValue() as? NSNumber
     }
+
+    /// Whether macOS auto-brightness is on for the Touch Bar (CoreBrightness `DisplayBrightnessAuto`).
+    static var autoBrightness: Bool? { copyNumber(forKey: "DisplayBrightnessAuto")?.boolValue }
+
+    /// The ambient light, in lux, that auto-brightness is working from (`AggregatedLux`).
+    static var lux: Float? { copyNumber(forKey: "AggregatedLux")?.floatValue }
 
     /// Switching the panel off and on leaves its brightness at the bottom of its range (about
     /// 12 nits), and macOS doesn't re-check the light sensor until the screen next wakes.
